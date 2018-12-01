@@ -1,0 +1,301 @@
+/* 
+	Name:		WSPR Telemetry Beacon
+	Created:	11/11/2018
+	Author:     WA6PZB
+
+	11/24/2018	Build 100	Re-test of Character Array issue fix
+	11/24/2018	Build 101	Grid locator field now encoding temperature in frame 2
+	11/25/2018  Build 102	Suffix of call sign encoded with humidity in frame 2
+	11/25/2018  Build 103	TX at 0,10,20,30,40, and 50 minutes past each hour
+
+*/
+
+// Build Number
+int build = 103;
+
+#include <si5351.h>
+#include <JTEncode.h>
+#include <rs_common.h>
+#include <int.h>
+#include <string.h>
+#include <SoftwareSerial.h>
+#include <TinyGPS.h>
+#include "Adafruit_Si7021.h"
+
+
+
+// Mode defines
+#define WSPR_TONE_SPACING 146 // ~1.46 Hz
+#define WSPR_DELAY 683000 // Delay value for WSPR
+
+// #define WSPR_DEFAULT_FREQ       10140100UL  //30m
+#define WSPR_DEFAULT_FREQ 7040100UL // 40m
+int led = 13;
+
+// Class instantiation
+Si5351 si5351;
+
+JTEncode jtencode;
+
+unsigned long freq;
+uint8_t symbol_count;
+char call[] = "CALLSIGN"; // These will change in frame #2
+char loc[] = "DM13"; // These will change in frame #2
+uint8_t dbm = 13; // This one will not change
+uint16_t tone_delay, tone_spacing;
+uint8_t tx_buffer[255];
+
+TinyGPS gps;
+
+SoftwareSerial ss(4, 3);  // 4800-baud serial GPS device hooked up on pins 4(rx) and 3(tx).
+
+Adafruit_Si7021 sensor = Adafruit_Si7021(); // Temp & Humidity sensor
+
+char texth[] = "AAAAAAAAAAAAAAAAAAAAAAA"; // Humidity char array - initial value to allocate memory otherwise they overwrite
+char textt[] = "BBBBBBBBBBBBBBBBBBBBBBB"; // Temperature char array
+
+
+void setup()
+{
+  // Initialize the Si5351
+  // Change the 2nd parameter in init if using a ref osc other
+  // than 25 MHz
+  si5351.init(SI5351_CRYSTAL_LOAD_8PF, 0, 0);
+  // Set the mode to use
+  // Set the proper frequency, tone spacing, symbol count, and
+  // tone delay depending on mode
+  freq = WSPR_DEFAULT_FREQ;
+  symbol_count = WSPR_SYMBOL_COUNT; // From the library defines
+  tone_spacing = WSPR_TONE_SPACING;
+  tone_delay = WSPR_DELAY;
+  // Set CLK0 output
+  si5351.drive_strength(SI5351_CLK0, SI5351_DRIVE_8MA); // Set for max power if desired
+  si5351.output_enable(SI5351_CLK0, 0); // Disable the clock initially
+  
+  pinMode(led, OUTPUT); // Arduino LED used for TX indicator
+  
+  Serial.begin(115200); // Console Serial baud rate
+  
+  ss.begin(4800); // GPS Serial - Start a the default baud rate of GPS
+  // Increase GPS baud rate to 9600 (sent 3 times)
+  ss.println("$PMTK251,9600*17");
+  // or ss.print("$PMTK251,9600*17\r\n");
+  delay(500);
+  ss.println("$PMTK251,9600*17");
+  delay(500);
+  ss.println("$PMTK251,9600*17");
+  ss.begin(9600); // Run GPS at 9600 baud noe
+  
+  delay(1000);
+}
+
+void loop()
+{
+  while (ss.available())
+  {
+    int c = ss.read(); // Read GPS data
+    if (gps.encode(c))
+      // If GPS strings are ready
+    sendWSPR(); // Send the WSPR data
+  }
+}
+
+void sendWSPR()
+{
+  byte hr, mn, sec;
+  unsigned long fix_age;
+  // get time info, ignore date, etc.
+  gps.crack_datetime(NULL, NULL, NULL, & hr, & mn, & sec, NULL, & fix_age);
+  if ((mn == 59 || mn == 9 || mn == 19 || mn == 29 || mn == 39 || mn == 49) && (fix_age <= 60 && sec >= 58))
+  {
+	Serial.print("Build ");
+	Serial.println(build);
+	
+	Serial.print(hr);
+    Serial.print(":"); // print out time (crudely!)
+    Serial.print(mn);
+    Serial.print(":");
+    Serial.print(sec);
+    Serial.print("-");
+    Serial.print(fix_age);
+    Serial.println(" UTC");
+    
+	getSensor(textt, texth); // Get the Temp and Humid for sensor with encoding
+    
+    Serial.print("Encoded H: "); Serial.println(texth);
+    Serial.print("Encoded T: "); Serial.println(textt);
+    
+	delay(300);
+    
+	// ****** Send WSPR Frame #1 ******
+
+    // JTEncode variables
+
+    memset(tx_buffer, 0, 255);
+    char call[] = "WA6PZB";
+    char loc[] = "DM13";
+    jtencode.wspr_encode(call, loc, dbm, tx_buffer);
+    
+	// Loop through the string, transmitting one character at a time.
+    uint8_t i;
+    digitalWrite(led, HIGH); // turn the LED for Frame 1 TX period
+    
+	// Reset the tone to the base frequency and turn on the output
+    si5351.output_enable(SI5351_CLK0, 1);
+    
+	// Now transmit the channel symbols
+    for (i = 0; i < symbol_count; i++)
+    {
+      /*
+      Fix installed below per
+      KJ6FO blog
+      http://squirrelengineering.com/high-altitude-balloon/adrift-problem-solving-fs2-wspr-drift/
+      */
+      unsigned long starttime = micros(); // Get Start time
+      si5351.set_freq((freq * SI5351_FREQ_MULT) + (tx_buffer[i] * tone_spacing), SI5351_CLK0);
+      while ((micros() - starttime) < 683000)
+      {
+      }; // Wait until time is up
+    }
+    
+	// Turn off the output
+    si5351.output_enable(SI5351_CLK0, 0);
+    digitalWrite(led, LOW); // turn off at end of Frame 1
+    delay(9000); // wait for next WSPR frame period
+    
+	// ****** Send WSPR Frame #2 ******
+
+    // JTEncode variables
+    memset(tx_buffer, 0, 255);
+    
+	// String Copy new values into call and loc
+    strcpy(call, "0A0");  // Call sign prefix for telemetry
+	strcat(call, texth);  // Place encoded humidity at end of call sign
+    strcpy(loc, textt);   // Put encoded temperature into grid loc field
+
+    jtencode.wspr_encode(call, loc, dbm, tx_buffer);
+	
+    
+	// Loop through the string, transmitting one character at a time.
+    digitalWrite(led, HIGH); // turn the LED on Frame 2
+    
+	// Reset the tone to the base frequency and turn on the output
+    si5351.output_enable(SI5351_CLK0, 1);
+    
+	// Now transmit the channel symbols
+    for (i = 0; i < symbol_count; i++)
+    {
+      /*
+      Fix installed below per
+      KJ6FO blog
+      http://squirrelengineering.com/high-altitude-balloon/adrift-problem-solving-fs2-wspr-drift/
+      */
+      unsigned long starttime = micros(); // Get Start time
+      si5351.set_freq((freq * SI5351_FREQ_MULT) + (tx_buffer[i] * tone_spacing), SI5351_CLK0);
+      while ((micros() - starttime) < 683000)
+      {
+      }; // Wait until time is up
+    }
+    
+	// Turn off the output
+    si5351.output_enable(SI5351_CLK0, 0);
+    digitalWrite(led, LOW); // turn off at end of Frame 2
+  }
+}
+
+void getSensor(char textt[11], char texth[11])
+{
+  sensor.begin(); // Temp & Humidity sensor
+  float temp = 0;
+  float humid = 0;
+  float tempf = 0.0;
+  temp = sensor.readTemperature() * 10;
+  tempf = sensor.readTemperature();
+  humid = sensor.readHumidity() * 10;
+  String humid_str = String(humid, 0);
+  String temp_str = String(temp, 0);
+  
+  // encode humid from numbers to letters for last 3 letters of telemetry call sign
+  
+  humid_str.toCharArray(texth, 4); // String to char array conversion
+
+  char cipher[] = " ZIHGFEDCBA 1234567890"; // right side of array are input values, left is the output 1=A, 2=B...0=Z
+  {
+    for (int i = 0; i < strlen(texth); i++)
+    {
+      char * charPtr = strchr(cipher, texth[i]);
+      if (charPtr != NULL)
+      {
+        int pos = charPtr - cipher;
+        texth[i] = cipher[strlen(cipher) - pos];
+      }
+    }
+  }
+  // Encode temp for use in Grid Loc field.
+  // Example 25.3 C temp will be TC25
+  // ^^^^
+  // ||||
+  // |||+----- 5  Digit two of temp no encoding
+  // ||+------ 2  Digit one of temp no encoding
+  // |+------- C  Digit three of temp with alpha encoding A=1, B=2, ..., R=0
+  // +-------- T  Indicate T for temp in the range of 0 to 99 C
+  
+  int tempa; // no decimal value temp
+  int tempb; // the decimal value of tem
+  tempa = tempf;
+  tempb = tempf * 10 - tempa * 10;
+  
+ 
+  if (tempb == 0)
+  {
+    textt[0] = 'R';
+  }
+  if (tempb == 1)
+  {
+    textt[0] = 'A';
+  }
+  if (tempb == 2)
+  {
+    textt[0] = 'B';
+  }
+  if (tempb == 3)
+  {
+    textt[0] = 'C';
+  }
+  if (tempb == 4)
+  {
+    textt[0] = 'D';
+  }
+  if (tempb == 5)
+  {
+    textt[0] = 'E';
+  }
+  if (tempb == 6)
+  {
+    textt[0] = 'F';
+  }
+  if (tempb == 7)
+  {
+    textt[0] = 'G';
+  }
+  if (tempb == 8)
+  {
+    textt[0] = 'H';
+  }
+  if (tempb == 9)
+  {
+    textt[0] = 'I';
+  }
+  textt[1] = '\0';  //add terminator to truncate array
+  
+  // Format the textt char array
+
+  char tempa_arry[]="";
+  String tempa_str = String(tempa,DEC);
+  tempa_str.toCharArray(tempa_arry, 4);  // String to char array conversion
+  char  gridtemp[5] = "R"; // Create array with the single character
+  strcat(gridtemp, textt); // Join textt after the gridtemp array
+  strcat(gridtemp, tempa_arry);
+  strcpy(textt, gridtemp); // Copy the new gridtemp array back into textt
+  
+}
